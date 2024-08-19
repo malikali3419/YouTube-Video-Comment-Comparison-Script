@@ -3,8 +3,17 @@ import requests
 import re
 import csv
 import logging
+import os, time
 from datetime import datetime
-import os
+from selenium import webdriver
+from selenium import webdriver
+from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+from webdriver_manager.chrome import ChromeDriverManager
 
 logging.basicConfig(
     level=logging.DEBUG,  # Set the log level
@@ -43,6 +52,17 @@ class YouTubeCommentProcessor:
         except Exception as e:
             logger.error(f"An error occurred while loading the Excel file: {e}")
             raise
+        
+        self.options = Options()
+        self.options.add_argument('--disable-dev-shm-usage')
+        self.options.add_argument("--headless")
+        self.options.add_argument('--no-sandbox')
+        self.options.add_argument(
+            "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.88 Safari/537.36"
+            )
+        self.chromedriver_path = ChromeDriverManager().install()
+    
+        self.hadzy_url = "https://www.hadzy.com/"
 
     def extract_video_id(self, url):
         """
@@ -67,6 +87,7 @@ class YouTubeCommentProcessor:
         Returns:
             dict: The response JSON containing video statistics.
         """
+    
         url = f"https://www.hadzy.com/api/videos/{video_id}"
         response = requests.get(url)
         return response.json()
@@ -83,18 +104,68 @@ class YouTubeCommentProcessor:
         Returns:
             dict: The response JSON containing comments.
         """
-        url = f"https://www.hadzy.com/api/comments/{video_id}?page={page}&size={size}&searchTerms=&author="
+        url = f"https://www.hadzy.com/api/comments/{video_id}?page={page}&size={size}&sortBy=publishedAt&direction=asc%20%20%20%20%20%20&searchTerms=&author="
         response = requests.get(url)
         if show_logs:
             logger.info(f"Getting Comments from this: {video_link} on page number: {page}")
         return response.json()
     
-    def process_comments_in_hadzy(self, video_id):
-        url = f"https://www.hadzy.com/api/videos/{video_id}?entity=true"
-        response = requests.get(url)
-        return response.json()
+    def process_comments_in_hadzy(self, video_link):
+        try:
+            self.driver = webdriver.Chrome(service=Service(self.chromedriver_path), options=self.options)
+            self.driver.get(self.hadzy_url)
+            
+            try:
+                accept_all_button = WebDriverWait(self.driver, 10).until(
+                    EC.visibility_of_element_located((By.XPATH, "//span[text()='Accept all']"))
+                )
+                accept_all_button.click()
+            except TimeoutException:
+                logger.info("Accept cookies button not found so the scrapper is proceeding ....")
+            
+            input_div = WebDriverWait(self.driver, 10).until(
+                EC.visibility_of_element_located((By.CLASS_NAME, "MuiInputBase-root"))
+            )
+            input_link = WebDriverWait(input_div, 10).until(
+                EC.visibility_of_element_located((By.TAG_NAME, 'input'))
+            )
+            input_link.send_keys(video_link)
+            
+            search_btn = WebDriverWait(self.driver, 10).until(
+                EC.element_to_be_clickable((By.CLASS_NAME, 'MuiButtonBase-root'))
+            )
+            search_btn.click()
+            
+            time.sleep(2)
+            
+            card_content_div = WebDriverWait(self.driver, 10).until(
+                EC.presence_of_all_elements_located((By.CLASS_NAME, "MuiCardContent-root"))
+            )
+            try:
+                load_data_btn = WebDriverWait(card_content_div[0], 10).until(
+                    EC.element_to_be_clickable((By.XPATH, "//button[@aria-label='load data']"))
+                )
+                load_data_btn.click()
+            except TimeoutException:
+                logger.info("Load Data button not found so the scrapper is proceeding ....")
 
-    def process_video(self, video_id, video_link):
+            
+            comments_btn = WebDriverWait(self.driver, 50).until(
+                EC.presence_of_element_located((By.XPATH, "//button[@aria-label='view comments']"))
+            )
+            
+            comments_btn.click()
+            
+            time.sleep(2)
+            self.driver.quit()
+            if comments_btn:
+                return
+        except Exception as e:
+            logger.error("Failed to load comments on hadzy....", e)
+            return
+
+
+    def process_video(self, channel_name, index, video_id, video_link):
         """
         Processes comments for a single video, fetching all pages up to 1000.
 
@@ -111,8 +182,11 @@ class YouTubeCommentProcessor:
             video_link=video_link,
             show_logs=False
         )
-        self.process_comments_in_hadzy(video_id)
-        total_page_count = comments_data['pageInfo']['totalPages']
+        self.process_comments_in_hadzy(video_link)
+        page_info = comments_data.get("pageInfo", "")
+        total_page_count = 0
+        if page_info:
+            total_page_count = page_info.get("totalPages", 0)
         
         comments_list = []
 
@@ -123,7 +197,15 @@ class YouTubeCommentProcessor:
                 video_link=video_link
             )
             comments_list.extend(comments_data['content'])
+        
+        if len(comments_list) == 0:
+            os.makedirs('failed_files', exist_ok=True)
 
+            screenshot_path = f'failed_files/{channel_name}_{index + 1}_screenshot_{video_id}.png'
+            self.driver.save_screenshot(screenshot_path)
+            print(f"Screenshot saved to {screenshot_path}")
+            self.driver.save_screenshot(f'failed_files/screenshot_{video_id}.png')
+            
         stats = self.get_video_statistics(video_id)
         title = stats['items'][0]['snippet']['title']
         upload_time = stats['items'][0]['snippet']['publishedAt']
@@ -162,13 +244,19 @@ class YouTubeCommentProcessor:
 
         stats_a = self.get_video_statistics(video_id_a)
         stats_b = self.get_video_statistics(video_id_b)
-
-        comment_count_a = int(stats_a['items'][0]['statistics']['commentCount'])
-        comment_count_b = int(stats_b['items'][0]['statistics']['commentCount'])
+        comment_count_a, comment_count_b= 0, 0
+        
+        if stats_a and stats_b:
+            comment_count_a = int(stats_a['items'][0]['statistics']['commentCount']) if stats_a['items'][0]['statistics']['commentCount'] else 0
+            comment_count_b = int(stats_b['items'][0]['statistics']['commentCount']) if stats_b['items'][0]['statistics']['commentCount'] else 0
+            if not comment_count_a:
+                comment_count_a = 0
+            if not comment_count_b:
+                comment_count_b = 0
 
         if comment_count_a > 100 and comment_count_b > 100:
-            result_a = self.process_video(video_id_a, row['Video_URL_A'])
-            result_b = self.process_video(video_id_b, row['Video_URL_B'])
+            result_a = self.process_video(channel_a, index, video_id_a, row['Video_URL_A'])
+            result_b = self.process_video(channel_a, index, video_id_b, row['Video_URL_B'])
 
             title_a, upload_date_a, upload_time_a, comment_count_a, comments_list_a = result_a
             title_b, upload_date_b, upload_time_b, comment_count_b, comments_list_b = result_b
@@ -209,6 +297,8 @@ class YouTubeCommentProcessor:
                         row_data.extend([''] * 6)
 
                     writer.writerow(row_data)
+        else:
+            logger.info(f"In row no.{index + 1}, One or both video has less than 100 comments: A={comment_count_a} & B={comment_count_b}")
 
     def process_file(self):
         """

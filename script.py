@@ -14,6 +14,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
+import uuid
 
 logging.basicConfig(
     level=logging.DEBUG,  # Set the log level
@@ -34,28 +35,42 @@ logger = logging.getLogger(__name__)
 
 class YouTubeCommentProcessor:
 
-    def __init__(self, file_path):
+    def __init__(self, reprocess=False, reprocess_try=1):
         """
         Initializes the YouTubeCommentProcessor with the given file path.
 
         Args:
             file_path (str): The path to the Excel file containing video data.
         """
+        if not reprocess:
+            self.excel_file_name = "animal"
+            if not self.excel_file_name.endswith('.xlsx'):
+                self.excel_file_name += '.xlsx'
+            file_path = os.path.join(os.getcwd(), self.excel_file_name)
+        else:
+            self.excel_file_name = 'requested_links.xlsx'
+            file_path = os.path.join(os.getcwd(), self.excel_file_name)
+        
         self.file_path = file_path
+        self.failed_video_found = False
+        self.reprocess_try = reprocess_try
         try:
             self.data_frame = pd.read_excel(self.file_path)
-            logger.info("File Loaded Successfully!")
-            logger.info(self.data_frame.head())
+            logging.info("File Loaded Successfully!")
+            logging.info(self.data_frame.head())
+            logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(message)s')
+
         except FileNotFoundError:
             logger.error(f"Error: The file '{self.file_path}' was not found.")
             raise
         except Exception as e:
-            logger.error(f"An error occurred while loading the Excel file: {e}")
-            raise
+            logger.error(f"Error: The file '{self.file_path}' was not found.")
+            raise    
+
         
         self.options = Options()
         self.options.add_argument('--disable-dev-shm-usage')
-        self.options.add_argument("--headless")
+        # self.options.add_argument("--headless")
         self.options.add_argument('--no-sandbox')
         self.options.add_argument(
             "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.88 Safari/537.36"
@@ -175,20 +190,26 @@ class YouTubeCommentProcessor:
         Returns:
             tuple: A tuple containing video metadata and a list of comments.
         """
-        comments_data = self.get_comments(
-            video_id=video_id,
-            page=0,
-            size=100,
-            video_link=video_link,
-            show_logs=False
-        )
-        self.process_comments_in_hadzy(video_link)
-        page_info = comments_data.get("pageInfo", "")
         total_page_count = 0
-        if page_info:
-            total_page_count = page_info.get("totalPages", 0)
+        max_tries = 1
+        while(max_tries <= 3 and total_page_count == 0):
+            self.process_comments_in_hadzy(video_link)
+            comments_data = self.get_comments(
+                video_id=video_id,
+                page=0,
+                size=100,
+                video_link=video_link,
+                show_logs=False
+            )
+            self.process_comments_in_hadzy(video_link)
+            page_info = comments_data.get("pageInfo", "")
+            if page_info:
+                total_page_count = page_info.get("totalPages", 0)
+            max_tries += 1
         
         comments_list = []
+        if total_page_count == 0:
+            return
 
         for page in range(0, min(total_page_count, 1000) + 1):
             comments_data = self.get_comments(video_id=video_id,
@@ -227,6 +248,52 @@ class YouTubeCommentProcessor:
         """
         dt = datetime.fromisoformat(datetime_str.replace('Z', '+00:00'))
         return dt.date().isoformat(), dt.time().isoformat()
+    
+    def delete_already_exits_file(self, file_name):
+        file_path = os.path.join(os.getcwd(), file_name)
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            print(f"File {file_path} has been removed successfully.")
+        else:
+            print(f"File {file_path} does not exist.")
+        
+    
+    def save_row_to_excel(self, row):
+        """
+        Saves the row data to a new Excel file with specified headers.
+
+        Args:
+            row (pd.Series): A row from the DataFrame.
+        """
+        if self.reprocess_try == 2:
+            file_name = f"requested_links_{2}.xlsx"
+        else:
+            file_name = f"requested_links.xlsx"
+        headers = [
+            'Channel_Name_A',
+            'Video_Title_A',
+            'Video_URL_A',
+            'Channel_Name_B',
+            'Video_Title_B',
+            'Video_URL_B',
+            'Similarity'
+        ]
+
+        # Check if file exists
+        try:
+            df_existing = pd.read_excel(file_name)
+            with pd.ExcelWriter(file_name, engine='openpyxl', mode='a', if_sheet_exists='overlay') as writer:
+                row_to_add = {header: row[header] for header in headers}
+                df_new = pd.DataFrame([row_to_add])
+                df_new.to_excel(writer, index=False, header=False, startrow=writer.sheets['Sheet1'].max_row)
+        except FileNotFoundError:
+            # Create a new file
+            with pd.ExcelWriter(file_name, engine='openpyxl') as writer:
+                row_to_add = {header: row[header] for header in headers}
+                df_new = pd.DataFrame([row_to_add])
+                df_new.to_excel(writer, index=False, header=headers)
+                
+        self.failed_video_found = True
 
     def process_row(self, row, index):
         """
@@ -257,6 +324,9 @@ class YouTubeCommentProcessor:
         if comment_count_a > 100 and comment_count_b > 100:
             result_a = self.process_video(channel_a, index, video_id_a, row['Video_URL_A'])
             result_b = self.process_video(channel_a, index, video_id_b, row['Video_URL_B'])
+            if result_a is None and result_b is None:
+                self.save_row_to_excel(row)
+                return
 
             title_a, upload_date_a, upload_time_a, comment_count_a, comments_list_a = result_a
             title_b, upload_date_b, upload_time_b, comment_count_b, comments_list_b = result_b
@@ -268,8 +338,8 @@ class YouTubeCommentProcessor:
             with open(f'{channel_a}_{index + 1}_{rows_count}.csv', 'w', newline='', encoding='utf-8') as file:
                 writer = csv.writer(file)
                 writer.writerow([
-                    'Video_Title_A', 'Video_Upload_DateTime_A', 'Video_Comment_A', 'Comment_Date_A', 'Comment_Time_A',
-                    'Video_Title_B', 'Video_Upload_DateTime_B', 'Video_Comment_B', 'Comment_Date_B', 'Comment_Time_B'
+                    'Video_Title_A', 'Video_Upload_DateTime_A', 'Video_Comment_A', 'Comment_Date_A', 'Comment_Time_A', 'Video_A_Comment_Author_Name', "Video_A_Comment_Likes_Count",
+                    'Video_Title_B', 'Video_Upload_DateTime_B', 'Video_Comment_B', 'Comment_Date_B', 'Comment_Time_B', 'Video_B_Comment_Author_Name', "Video_B_Comment_Likes_Count",
                 ])
 
                 max_comments_count = max(len(comments_list_a), len(comments_list_b))
@@ -281,7 +351,7 @@ class YouTubeCommentProcessor:
                         comment_date_a, comment_time_a = self.split_datetime(comment_a['publishedAt'])
                         row_data.extend([
                             title_a, upload_time_date_a,
-                            comment_a['textDisplay'], comment_date_a, comment_time_a
+                            comment_a['textDisplay'], comment_date_a, comment_time_a, comment_a['authorDisplayName'], comment_a['likeCount']
                         ])
                     else:
                         row_data.extend([''] * 6)
@@ -291,7 +361,7 @@ class YouTubeCommentProcessor:
                         comment_date_b, comment_time_b = self.split_datetime(comment_b['publishedAt'])
                         row_data.extend([
                             title_b, upload_time_date_b,
-                            comment_b['textDisplay'], comment_date_b, comment_time_b
+                            comment_b['textDisplay'], comment_date_b, comment_time_b, comment_b['authorDisplayName'], comment_b['likeCount']
                         ])
                     else:
                         row_data.extend([''] * 6)
@@ -300,35 +370,29 @@ class YouTubeCommentProcessor:
         else:
             logger.info(f"In row no.{index + 1}, One or both video has less than 100 comments: A={comment_count_a} & B={comment_count_b}")
 
-    def process_file(self):
+    def process_file(self, failed_file_name="requested_links.xlsx"):
         """
         Processes the entire Excel file, row by row.
         """
         for index, row in self.data_frame.iterrows():
             self.process_row(row, index)
-
-
-def find_excel_file():
-    """
-    Finds the first .xls or .xlsx file in the current directory.
-
-    Returns:
-        str: The path to the Excel file, or None if no file is found.
-    """
-    for file in os.listdir():
-        if file.endswith(".xls") or file.endswith(".xlsx"):
-            return file
-    return None
+        if self.failed_video_found and self.reprocess_try != 2:
+            reprocess = input("Do you want to reprocess the failed videos (Y/N)")
+            if reprocess.lower() == "y":
+                try:
+                    processor = YouTubeCommentProcessor(True, reprocess_try=2)
+                    processor.process_file()
+                except Exception as e:
+                    logger.error(f"An error occurred: {e}")
+            else:
+                return
+        else:
+            return       
 
 
 if __name__ == "__main__":
     try:
-        excel_file = find_excel_file()
-        if excel_file:
-            logger.info(f"Found Excel file: {excel_file}")
-            processor = YouTubeCommentProcessor(file_path=excel_file)
-            processor.process_file()
-        else:
-            logger.error("No .xls or .xlsx file found in the current directory.")
+        processor = YouTubeCommentProcessor()
+        processor.process_file()
     except Exception as e:
         logger.error(f"An error occurred: {e}")
